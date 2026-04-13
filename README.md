@@ -14,14 +14,6 @@ The backend is built with FastAPI and connects to Google BigQuery. It provides R
 - Return customer order history
 - Calculate loyalty points from historical order data
 
-## Technology Stack
-- FastAPI
-- Python
-- Google BigQuery
-- Poetry
-- Docker
-- Google Cloud Run
-
 ## Purpose of This Repository
 This repository is responsible for the server-side logic and data access layer of the project. It handles requests from the frontend and returns the appropriate data from the Uncle Joe’s dataset.
 
