@@ -20,4 +20,4 @@ This repository is responsible for the server-side logic and data access layer o
 ## Team
 This project is being developed as part of a course project using a separate backend and frontend repository structure.
 
-# committing for submission requirement. Ethan 
+# committing for submission requirement. Ethan, Hussain
