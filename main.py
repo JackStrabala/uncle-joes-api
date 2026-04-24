@@ -23,7 +23,9 @@ DATASET_ID = "uncle_joes"
 
 LOCATIONS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.locations`"
 MENU_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.menu`"
-
+ORDERS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.orders`"
+ORDER_ITEMS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.order_items`"
+MEMBERS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.members`"
 
 def format_time_value(value) -> Optional[str]:
     if value is None:
@@ -133,7 +135,24 @@ class MenuItem(BaseModel):
     calories: Optional[int] = None
     price: Optional[float] = None
 
+class OrderItem(BaseModel):
+    item_name: Optional[str] = None
+    size: Optional[str] = None
+    quantity: Optional[int] = None
+    price: Optional[float] = None
 
+
+class MemberOrder(BaseModel):
+    order_id: str
+    order_date: Optional[str] = None
+    store_location: Optional[str] = None
+    order_total: Optional[float] = None
+    items: List[OrderItem] = []
+
+
+class PointsBalance(BaseModel):
+    member_id: str
+    points_balance: int
 @app.get("/")
 def root():
     return {"message": "Uncle Joe's Coffee API is running"}
@@ -227,3 +246,96 @@ def get_menu_item(item_id: str):
         raise HTTPException(status_code=404, detail="Menu item not found")
 
     return dict(rows[0])
+
+@app.get("/members/{member_id}/orders", response_model=List[MemberOrder])
+def get_member_orders(member_id: str):
+    query = f"""
+        SELECT
+            o.order_id,
+            CAST(o.order_date AS STRING) AS order_date,
+            o.order_total,
+            l.city,
+            l.state,
+            oi.item_name,
+            oi.size,
+            oi.quantity,
+            oi.price
+        FROM {ORDERS_TABLE} o
+        LEFT JOIN {LOCATIONS_TABLE} l
+            ON o.store_id = l.id
+        LEFT JOIN {ORDER_ITEMS_TABLE} oi
+            ON o.order_id = oi.order_id
+        WHERE o.member_id = @member_id
+        ORDER BY o.order_date DESC, o.order_id
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
+        ]
+    )
+
+    rows = client.query(query, job_config=job_config).result()
+
+    orders = {}
+
+    for row in rows:
+        record = dict(row)
+        order_id = str(record["order_id"])
+
+        city = record.get("city")
+        state = record.get("state")
+
+        if city and state:
+            store_location = f"{city}, {state}"
+        elif city:
+            store_location = city
+        elif state:
+            store_location = state
+        else:
+            store_location = "Unknown location"
+
+        if order_id not in orders:
+            orders[order_id] = {
+                "order_id": order_id,
+                "order_date": record.get("order_date"),
+                "store_location": store_location,
+                "order_total": float(record["order_total"]) if record.get("order_total") is not None else None,
+                "items": [],
+            }
+
+        if record.get("item_name") is not None:
+            orders[order_id]["items"].append(
+                {
+                    "item_name": record.get("item_name"),
+                    "size": record.get("size"),
+                    "quantity": int(record["quantity"]) if record.get("quantity") is not None else None,
+                    "price": float(record["price"]) if record.get("price") is not None else None,
+                }
+            )
+
+    return list(orders.values())
+
+@app.get("/members/{member_id}/points", response_model=PointsBalance)
+def get_member_points(member_id: str):
+    query = f"""
+        SELECT
+            @member_id AS member_id,
+            COALESCE(SUM(FLOOR(order_total)), 0) AS points_balance
+        FROM {ORDERS_TABLE}
+        WHERE member_id = @member_id
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("member_id", "STRING", member_id)
+        ]
+    )
+
+    rows = list(client.query(query, job_config=job_config).result())
+    record = dict(rows[0])
+
+    return {
+        "member_id": member_id,
+        "points_balance": int(record["points_balance"]),
+    }
