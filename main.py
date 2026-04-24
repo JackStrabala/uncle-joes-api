@@ -1,16 +1,17 @@
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response, Cookie
 from fastapi.middleware.cors import CORSMiddleware
 from google.cloud import bigquery
 from pydantic import BaseModel
-
+import bcrypt
 
 app = FastAPI(title="Uncle Joe's Coffee API")
 
+# Updated CORS to handle credentials for session/token persistence
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # In production, replace "*" with your actual frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,9 +24,24 @@ DATASET_ID = "uncle_joes"
 
 LOCATIONS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.locations`"
 MENU_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.menu`"
+
+MEMBERS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.members`"
 ORDERS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.orders`"
 ORDER_ITEMS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.order_items`"
-MEMBERS_TABLE = f"`{PROJECT_ID}.{DATASET_ID}.members`"
+
+# --- Pydantic Models for Auth ---
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginResponse(BaseModel):
+    success: bool
+    message: str
+    member_id: Optional[str] = None
+
+# --- Existing Helper Functions ---
+
 
 def format_time_value(value) -> Optional[str]:
     if value is None:
@@ -35,7 +51,6 @@ def format_time_value(value) -> Optional[str]:
         return f"{num:04d}"
     except (ValueError, TypeError):
         return str(value)
-
 
 def format_hours(row: dict) -> str:
     days = [
@@ -60,54 +75,40 @@ def format_hours(row: dict) -> str:
 
     return " | ".join(parts)
 
-
 def build_full_address(row: dict) -> str:
     address_parts = []
-
     if row.get("address_one"):
         address_parts.append(str(row["address_one"]).strip())
-
     if row.get("address_two"):
         address_parts.append(str(row["address_two"]).strip())
 
     city_state_zip_parts = []
-
     if row.get("city"):
         city_state_zip_parts.append(str(row["city"]).strip())
-
     if row.get("state"):
         city_state_zip_parts.append(str(row["state"]).strip())
 
     city_state = ", ".join(city_state_zip_parts)
-
     if row.get("zip_code"):
         zip_code = str(row["zip_code"]).strip()
-        if city_state:
-            city_state = f"{city_state} {zip_code}"
-        else:
-            city_state = zip_code
+        city_state = f"{city_state} {zip_code}" if city_state else zip_code
 
     if city_state:
         address_parts.append(city_state)
 
     if address_parts:
         return ", ".join(address_parts)
-
-    if row.get("location_map_address"):
-        return str(row["location_map_address"]).strip()
-
-    return "Unavailable"
-
+    return str(row.get("location_map_address", "Unavailable")).strip()
 
 def normalize_location_record(record: dict) -> dict:
     for field in ["zip_code", "phone_number", "fax_number", "email", "location_map_address", "near_by"]:
         if record.get(field) is not None:
             record[field] = str(record[field])
-
     record["address"] = build_full_address(record)
     record["hours"] = format_hours(record)
     return record
 
+# --- Data Models ---
 
 class Location(BaseModel):
     id: str
@@ -125,7 +126,6 @@ class Location(BaseModel):
     location_map_address: Optional[str] = None
     zip_code: Optional[str] = None
     near_by: Optional[str] = None
-
 
 class MenuItem(BaseModel):
     id: str
@@ -157,7 +157,71 @@ class PointsBalance(BaseModel):
 def root():
     return {"message": "Uncle Joe's Coffee API is running"}
 
+# NEW: Login Endpoint
+# NEW: Login Endpoint (Corrected for your specific Schema)
+@app.post("/login", response_model=LoginResponse)
+def login(login_data: LoginRequest, response: Response):
+    # Updated query to use 'id' and 'password' as seen in your screenshot
+    query = f"""
+        SELECT id, email, password
+        FROM {MEMBERS_TABLE}
+        WHERE email = @email
+        LIMIT 1
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("email", "STRING", login_data.email)
+        ]
+    )
+    
+    query_job = client.query(query, job_config=job_config)
+    results = list(query_job.result())
 
+    if not results:
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    member = results[0]
+    
+    # We must handle the case where the password field might be None/Null
+    db_password = member.get('password')
+    if not db_password:
+         raise HTTPException(status_code=401, detail="Account not set up")
+
+    # Check provided password against the hash in the DB
+    password_byte = login_data.password.encode('utf-8')
+    hash_byte = db_password.encode('utf-8')
+
+    try:
+        if bcrypt.checkpw(password_byte, hash_byte):
+            # Use 'id' here to match your schema
+            member_id_str = str(member.id)
+            response.set_cookie(key="session_user", value=member_id_str, httponly=True)
+            return {
+                "success": True,
+                "message": "Login successful",
+                "member_id": member_id_str
+            }
+    except ValueError:
+        # This triggers if the text in BigQuery isn't a valid bcrypt hash
+        raise HTTPException(
+            status_code=500, 
+            detail="Server data error: Password in database is not properly hashed."
+        )
+    
+    raise HTTPException(status_code=401, detail="Invalid email or password")
+
+# NEW: Logout Endpoint
+@app.post("/logout")
+def logout(response: Response):
+    response.delete_cookie("session_user")
+    return {"success": True, "message": "Logged out successfully"}
+
+@app.get("/auth/status")
+def get_auth_status(session_user: Optional[str] = Cookie(None)):
+    if session_user:
+        return {"is_logged_in": True, "member_id": session_user}
+    return {"is_logged_in": False}
+    
 @app.get("/locations", response_model=List[Location])
 def get_locations(
     state: Optional[str] = Query(default=None),
@@ -171,77 +235,41 @@ def get_locations(
         ORDER BY state, city
         LIMIT 100
     """
-
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
             bigquery.ScalarQueryParameter("state", "STRING", state),
             bigquery.ScalarQueryParameter("city", "STRING", city),
         ]
     )
-
     rows = client.query(query, job_config=job_config).result()
-
-    results = []
-    for row in rows:
-        record = dict(row)
-        results.append(normalize_location_record(record))
-
-    return results
-
+    return [normalize_location_record(dict(row)) for row in rows]
 
 @app.get("/locations/{location_id}", response_model=Location)
 def get_location(location_id: str):
     query = f"""
-        SELECT *
-        FROM {LOCATIONS_TABLE}
-        WHERE id = @id
-        LIMIT 1
+        SELECT * FROM {LOCATIONS_TABLE} WHERE id = @id LIMIT 1
     """
-
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("id", "STRING", location_id)
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", location_id)]
     )
-
     rows = list(client.query(query, job_config=job_config).result())
-
     if not rows:
         raise HTTPException(status_code=404, detail="Location not found")
-
-    record = dict(rows[0])
-    return normalize_location_record(record)
-
+    return normalize_location_record(dict(rows[0]))
 
 @app.get("/menu", response_model=List[MenuItem])
 def get_menu():
-    query = f"""
-        SELECT id, name, category, size, calories, price
-        FROM {MENU_TABLE}
-        ORDER BY category, name
-    """
-
+    query = f"SELECT id, name, category, size, calories, price FROM {MENU_TABLE} ORDER BY category, name"
     rows = client.query(query).result()
     return [dict(row) for row in rows]
 
-
 @app.get("/menu/{item_id}", response_model=MenuItem)
 def get_menu_item(item_id: str):
-    query = f"""
-        SELECT id, name, category, size, calories, price
-        FROM {MENU_TABLE}
-        WHERE id = @id
-        LIMIT 1
-    """
-
+    query = f"SELECT id, name, category, size, calories, price FROM {MENU_TABLE} WHERE id = @id LIMIT 1"
     job_config = bigquery.QueryJobConfig(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("id", "STRING", item_id)
-        ]
+        query_parameters=[bigquery.ScalarQueryParameter("id", "STRING", item_id)]
     )
-
     rows = list(client.query(query, job_config=job_config).result())
-
     if not rows:
         raise HTTPException(status_code=404, detail="Menu item not found")
 
