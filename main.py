@@ -264,7 +264,7 @@ def get_locations(
         WHERE (@state IS NULL OR state = @state)
           AND (@city IS NULL OR city = @city)
         ORDER BY state, city
-        LIMIT 100
+        LIMIT 500
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
